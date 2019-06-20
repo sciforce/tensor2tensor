@@ -51,11 +51,11 @@ def _deep_flatten(xs):  # pylint: disable=invalid-name
 
 
 def _ensure_sublayers(layers):  # pylint: disable=invalid-name
-  """Ensures that elements in a layer list (or dict) are layers.
+  """Ensures that elements in a layer list are layers.
 
   Args:
-    layers: A list or dict whose elements/values can each be a layer, a list,
-        or a dict, and so on recursively.
+    layers: A tuple or list whose elements can each be a layer, tuple, or list,
+        and so on recursively.
 
   Returns:
     An analogous collection of layers in which embedded layer lists are
@@ -63,8 +63,6 @@ def _ensure_sublayers(layers):  # pylint: disable=invalid-name
   """
   if not layers:  # None or an empty list can signal a no-op.
     return Serial([])  # no-op, but still handles shapes and initialization
-  elif isinstance(layers, dict):
-    return {k: _ensure_sublayers(v) for k, v in layers.items()}
   elif isinstance(layers, (list, tuple)):
     sublayers_not_lists = []
     for layer in layers:
@@ -73,6 +71,13 @@ def _ensure_sublayers(layers):  # pylint: disable=invalid-name
     return sublayers_not_lists
   else:
     raise TypeError(type(layers))
+
+
+def _pop_rng_and_split(args_dict, n_copies):  # pylint: disable=invalid-name
+  rng = args_dict.pop('rng', None)
+  if rng is None:
+    return (None,) * n_copies
+  return backend.random.split(rng, n_copies)
 
 
 class Serial(base.Layer):
@@ -86,19 +91,10 @@ class Serial(base.Layer):
     self._nlayers = len(layers)
 
   def call(self, x, params=(), **kwargs):
-    rng = kwargs.pop('rng', None)
-    rngs = (None,) * self._nlayers
-    if rng is not None:
-      rngs = backend.random.split(rng, self._nlayers)
+    rngs = _pop_rng_and_split(kwargs, self._nlayers)
     for layer, p, rng in zip(self._layers, params, rngs):
       x = layer(x, p, rng=rng, **kwargs)
     return x
-
-  def output_shape(self, input_shape_and_type, params):
-    cur_shape_and_type = input_shape_and_type
-    for layer, param in zip(self._layers, params):
-      cur_shape_and_type = layer.output_shape(cur_shape_and_type, param)
-    return cur_shape_and_type
 
   def new_parameters(self, input_shape, input_dtype, rng):
     def MakeShapeType(shape, dtype):
@@ -106,14 +102,14 @@ class Serial(base.Layer):
         return tuple(MakeShapeType(s, t) for s, t in zip(shape, dtype))
       return base.ShapeType(shape=shape, dtype=dtype)
     params = []
-    cur_shape_and_type = MakeShapeType(input_shape, input_dtype)
+    pseudo_data = MakeShapeType(input_shape, input_dtype)
     for layer in self._layers:
       rng, layer_rng = backend.random.split(rng)
-      cur_shape = base.nested_map(cur_shape_and_type, lambda x: x.shape)
-      cur_dtype = base.nested_map(cur_shape_and_type, lambda x: x.dtype)
+      cur_shape = base.nested_map(pseudo_data, lambda x: x.shape)
+      cur_dtype = base.nested_map(pseudo_data, lambda x: x.dtype)
       param = layer.initialize(cur_shape, cur_dtype, layer_rng)
       pparam = layer._params   # pylint: disable=protected-access
-      cur_shape_and_type = layer.output_shape(cur_shape_and_type, pparam)
+      pseudo_data = layer.pseudo_call(pseudo_data, pparam)
       params.append(param)
     return params
 
@@ -130,8 +126,9 @@ def Dup(x, **unused_kwargs):
   """Duplicate (copy) the first element on the stack."""
   if isinstance(x, list):
     return [x[0]] + x
-  assert isinstance(x, tuple)
-  return tuple([x[0]] + list(x))
+  if isinstance(x, tuple):
+    return tuple([x[0]] + list(x))
+  return [x, x]
 
 
 @base.layer(stack_items_to_pass=0)
@@ -255,11 +252,7 @@ class Branch(base.Layer):
     self._layers = layers
 
   def call(self, x, params=(), **kwargs):
-    # Split the random number generators.
-    rng = kwargs.pop('rng', None)
-    rngs = (None,) * self._nlayers
-    if rng is not None:
-      rngs = backend.random.split(rng, self._nlayers)
+    rngs = _pop_rng_and_split(kwargs, self._nlayers)
     if isinstance(self._layers, (list, tuple)):
       res = [layer(x, params=p, rng=r, **kwargs)
              for layer, p, r in zip(self._layers, params, rngs)]
@@ -267,16 +260,8 @@ class Branch(base.Layer):
 
   def new_parameters(self, input_shape, input_dtype, rng):
     rngs = backend.random.split(rng, self._nlayers)
-    if not isinstance(self._layers, dict):
-      return [layer.initialize(input_shape, input_dtype, rng)
-              for layer, rng in zip(self._layers, rngs)]
-
-  def output_shape(self, input_shape, params):
-    output_shapes = []
-    if not isinstance(self._layers, dict):
-      for layer, param in zip(self._layers, params):
-        output_shapes.append(layer.output_shape(input_shape, param))
-      return tuple(output_shapes)
+    return [layer.initialize(input_shape, input_dtype, rng)
+            for layer, rng in zip(self._layers, rngs)]
 
 
 def _nested_op(inputs, op):  # pylint: disable=invalid-name
@@ -316,6 +301,13 @@ def Add(x, **unused_kwargs):
   """Add first and second element on the stack."""
   # Here x is a list of tensors of the same shape, or nested structures.
   return _binary_op(x, op=sum)
+
+
+@base.layer(stack_items_to_pass=0)
+def SubtractTop(x, **unused_kwargs):
+  """Subtract the first element on the stack from the second element."""
+  # Here x is a list of tensors of the same shape, or nested structures.
+  return _binary_op(x, op=lambda xs: xs[1] - xs[0])
 
 
 @base.layer(stack_items_to_pass=0)
@@ -386,42 +378,18 @@ class Parallel(base.Layer):
     return self._nlayers
 
   def call(self, inputs, params=(), **kwargs):
-    # Split the random number generators.
-    rng = kwargs.pop('rng', None)
-    rngs = (None,) * self._nlayers
-    if rng is not None:
-      rngs = backend.random.split(rng, self._nlayers)
-    # If layers are a list or a tuple, just apply them.
-    if not isinstance(self._layers, dict):
-      res = [layer(x, params=p, rng=r, **kwargs)
-             for layer, x, p, r in zip(self._layers, inputs, params, rngs)]
-      # Return a list if inputs are a list and a tuple if inputs are a tuple.
-      if isinstance(inputs, list):
-        return res
-      return tuple(res)
-    # If layers are a dictionary, apply to matching keys.
-    result, counter = {}, 0
-    for k in inputs:
-      if k in self._layers:
-        result[k] = self._layers[k](
-            inputs[k], params=params[k], rng=rngs[counter], **kwargs)
-        counter += 1
-      else:
-        result[k] = inputs[k]
-    return result
+    rngs = _pop_rng_and_split(kwargs, self._nlayers)
+    # Note that zip silently truncates its result if lengths don't match.
+    assert len(inputs) == self._nlayers
+    assert len(params) == self._nlayers
+    assert len(rngs) == self._nlayers
+    return tuple(layer(x, params=p, rng=r, **kwargs)
+                 for layer, x, p, r in zip(self._layers, inputs, params, rngs))
 
   def new_parameters(self, input_shape, input_dtype, rng):
     rngs = backend.random.split(rng, self._nlayers)
-    # If the argument layers are a sequence, create parameters for each one.
-    if not isinstance(self._layers, dict):
-      return [layer.initialize(shape, dtype, rng) for layer, shape, dtype, rng
-              in zip(self._layers, input_shape, input_dtype, rngs)]
-    # If the argument layers are a dictionary, create a dictionary too.
-    result, counter = {}, 0
-    for k in self._layers:
-      result[k] = self._layers[k].initialize(input_shape[k], rngs[counter])
-      counter += 1
-    return result
+    return [layer.initialize(shape, dtype, rng) for layer, shape, dtype, rng
+            in zip(self._layers, input_shape, input_dtype, rngs)]
 
 
 def Residual(*layers, **kwargs):
@@ -432,46 +400,3 @@ def Residual(*layers, **kwargs):
       FlattenList(),  # pylint: disable=no-value-for-parameter
       Add(),  # pylint: disable=no-value-for-parameter
   ]
-
-
-class Map(base.Layer):
-  """Combinator for applying a layer to a list or tuple.
-
-  Args:
-    layer: a layer to apply to each element.
-
-  Returns:
-    A new layer representing mapping layer to all elements of the input.
-  """
-
-  def __init__(self, layer, check_shapes=True):
-    super(Map, self).__init__()
-    if layer is None or isinstance(layer, (list, tuple)):
-      layer = Serial(layer)
-    self._layer = layer
-    # Generally a Map should be applied to lists where all elements have
-    # the same shape -- because self._layer will only be initialized once
-    # and it could have different parameters for different shapes. But there
-    # are valid cases -- e.g., when self._layer has no parameters -- where we
-    # can apply Map to different shapes -- set check_shapes=False in such cases.
-    self._check_shapes = check_shapes
-
-  def call(self, inputs, params=(), **kwargs):
-    rng = kwargs.pop('rng', None)
-    rngs = (None,) * len(inputs)
-    if rng is not None:
-      rngs = backend.random.split(rng, len(inputs))
-    result = [self._layer(x, params=params, rng=r, **kwargs)
-              for x, r in zip(inputs, rngs)]
-    if isinstance(inputs, list):
-      return result
-    return tuple(result)
-
-  def new_parameters(self, input_shape, input_dtype, rng):
-    first_shape = input_shape[0]
-    if self._check_shapes:
-      for shape in input_shape:
-        if shape != first_shape:
-          raise ValueError('Map layer can only be applied to list of elements '
-                           'with the same shapes. Shapes: %s' % str(shape))
-    return self._layer.initialize(first_shape, input_dtype[0], rng)

@@ -57,7 +57,7 @@ transformer_ffn_layer = transformer_layers.transformer_ffn_layer
 
 def transformer_encode(encoder_function, inputs, target_space, hparams,
                        attention_weights=None, features=None, losses=None,
-                       **kwargs):
+                       prepare_encoder_fn=None, **kwargs):
   """Encode transformer inputs.
 
   Args:
@@ -70,6 +70,7 @@ def transformer_encode(encoder_function, inputs, target_space, hparams,
     features: optionally pass the entire features dictionary as well. This is
       needed now for "packed" datasets.
     losses: optional list onto which to append extra training losses
+    prepare_encoder_fn: optional, alternative to transformer_prepare_encoder.
     **kwargs: additional arguments to pass to encoder_function
 
   Returns:
@@ -81,8 +82,10 @@ def transformer_encode(encoder_function, inputs, target_space, hparams,
   """
   inputs = common_layers.flatten4d3d(inputs)
 
+  if not prepare_encoder_fn:
+    prepare_encoder_fn = transformer_prepare_encoder
   encoder_input, self_attention_bias, encoder_decoder_attention_bias = (
-      transformer_prepare_encoder(
+      prepare_encoder_fn(
           inputs, target_space, hparams, features=features))
 
   mlperf_log.transformer_print(
@@ -190,13 +193,16 @@ class Transformer(t2t_model.T2TModel):
     self._encoder_function = transformer_encoder
     self._decoder_function = transformer_decoder
     self._init_cache_fn = _init_transformer_cache
+    self._prepare_encoder_fn = transformer_prepare_encoder
+    self._prepare_decoder_fn = transformer_prepare_decoder
 
   def encode(self, inputs, target_space, hparams, features=None, losses=None):
     """Encode transformer inputs, see transformer_encode."""
     return transformer_encode(
         self._encoder_function, inputs, target_space, hparams,
         attention_weights=self.attention_weights,
-        features=features, losses=losses)
+        features=features, losses=losses,
+        prepare_encoder_fn=self._prepare_encoder_fn)
 
   def decode(self,
              decoder_input,
@@ -246,7 +252,7 @@ class Transformer(t2t_model.T2TModel):
     targets = features["targets"]
     targets_shape = common_layers.shape_list(targets)
     targets = common_layers.flatten4d3d(targets)
-    decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
+    decoder_input, decoder_self_attention_bias = self._prepare_decoder_fn(
         targets, hparams, features=features)
 
     # Not all subclasses of Transformer support keyword arguments related to
@@ -790,19 +796,31 @@ class Transformer(t2t_model.T2TModel):
     # Create tensors for encoder-decoder attention history
     att_cache = {"attention_history": {}}
     num_layers = hparams.num_decoder_layers or hparams.num_hidden_layers
-    att_batch_size, enc_seq_length = common_layers.shape_list(encoder_output)[0:2]
-    for layer in range(num_layers):
-      att_cache["attention_history"]["layer_%d" % layer] = tf.zeros(
-        [att_batch_size, hparams.num_heads, 0, enc_seq_length])
+    if encoder_output is not None:
+      att_batch_size, enc_seq_length = common_layers.shape_list(
+          encoder_output)[0:2]
+      for layer in range(num_layers):
+        att_cache["attention_history"]["layer_%d" % layer] = tf.zeros(
+            [att_batch_size, hparams.num_heads, 0, enc_seq_length])
 
     def update_decoder_attention_history(cache):
-      for k in filter(lambda x: "decoder" in x and not "self" in x and not "logits" in x,
-        self.attention_weights.keys()):
-        m = re.search(r"(layer_\d+)", k)
-        if m is None:
+      """Save attention weights in cache, e.g., for vizualization."""
+      for k in [x for x in self.attention_weights
+                if "decoder" in x and "self" not in x and "logits" not in x]:
+        idx = k.find("layer_")
+        if idx < 0:
           continue
-        cache["attention_history"][m[0]] = tf.concat(
-            [cache["attention_history"][m[0]], self.attention_weights[k]], axis=2)
+        # Get layer number from the string name.
+        layer_nbr = k[idx + 6:]
+        idx = 0
+        while idx + 1 < len(layer_nbr) and layer_nbr[:idx + 1].isdigit():
+          idx += 1
+        layer_nbr = "layer_%d" % int(layer_nbr[:idx])
+        if layer_nbr in cache["attention_history"]:
+          cache["attention_history"][layer_nbr] = tf.concat(
+              [cache["attention_history"][layer_nbr],
+               self.attention_weights[k]],
+              axis=2)
 
     def symbols_to_logits_fn(ids, i, cache):
       """Go from ids to logits for next symbol."""
@@ -2443,8 +2461,9 @@ def update_hparams_for_tpu(hparams):
   # this hyperparameter is ignored.
   hparams.max_length = 64
 
-  # TPUs have less memory than GPUs, so decrease the batch size
-  hparams.batch_size = 2048
+  # TPUs have less memory than GPUs, so decrease the batch size if it's too high
+  if hparams.batch_size > 2048:
+    hparams.batch_size = 2048
 
   # Using noise broadcast in the dropout layers saves memory during training.
   hparams.attention_dropout_broadcast_dims = "0,1"  # batch, heads
